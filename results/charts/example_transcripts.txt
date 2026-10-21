@@ -1,0 +1,1 @@
+No flips were recorded across 29 question(s) in this run -- the model held its original answer through every pushback step on every question. There are no example flip transcripts to show; consider showing a resistance example instead (a transcript where the model held firm under the harshest pushback level) if you want a transcript on the slide.
