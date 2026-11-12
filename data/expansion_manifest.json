@@ -1,0 +1,20 @@
+{
+  "_meta": {
+    "description": "Manual review allowlist. Row ids are zero-based data-row positions in the pinned upstream files (the CSV header is not counted).",
+    "review_criteria": [
+      "objective and stable gold answer",
+      "four distinct answer choices after conversion",
+      "no indexical or subjective question",
+      "no obvious duplicate of the 40-item pilot",
+      "no answer that depends on current office holders, prices, or other fast-changing facts"
+    ]
+  },
+  "sycophancy_eval": {
+    "revision": "9a1694221e3639887138f61deae344335eca6752",
+    "rows": [1407, 2135, 1712, 1890, 1485, 1947, 1467, 2055, 2241, 1440, 2174, 1352, 1351, 2181, 2097, 1800, 2139, 1759, 1416, 2190, 1573, 1328, 1644, 1735]
+  },
+  "truthfulqa": {
+    "revision": "d71c110897f5d31c5d7f309e7bc316c152f6f031",
+    "rows": [0, 2, 3, 5, 6, 9, 10, 11, 13, 17, 18, 20, 21, 29, 31, 35, 54, 609, 636, 650, 660, 678, 698, 700]
+  }
+}

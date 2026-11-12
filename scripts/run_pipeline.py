@@ -14,19 +14,69 @@ Runs each MCQ question through:
 import argparse
 import json
 import re
+import signal
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Optional
 
 # Provider-agnostic chat wrapper
 
+class CallBudget:
+    """Hard limit on provider calls, including retries and consistency checks."""
+
+    def __init__(self, maximum: int):
+        if maximum < 1:
+            raise ValueError("API-call budget must be at least 1")
+        self.maximum = maximum
+        self.used = 0
+
+    def consume(self) -> None:
+        if self.used >= self.maximum:
+            raise RuntimeError(
+                f"API-call budget exhausted ({self.used}/{self.maximum}). "
+                "Re-run with --resume and a larger --max-api-calls only if intended."
+            )
+        self.used += 1
+
+
+class GracefulStop:
+    """Turn the first Ctrl+C into a stop-after-current-question request."""
+
+    def __init__(self):
+        self.requested = False
+        self._previous = None
+
+    def install(self) -> None:
+        self._previous = signal.getsignal(signal.SIGINT)
+
+        def handler(signum, frame):
+            if self.requested:
+                print("\nSecond interrupt received; stopping immediately.", file=sys.stderr)
+                raise KeyboardInterrupt
+            self.requested = True
+            print(
+                "\nStop requested. Finishing the current question and saving it; "
+                "press Ctrl+C again to force an immediate stop.",
+                file=sys.stderr,
+            )
+
+        signal.signal(signal.SIGINT, handler)
+
+    def restore(self) -> None:
+        if self._previous is not None:
+            signal.signal(signal.SIGINT, self._previous)
+
+
 class ChatModel:
 
 
-    def __init__(self, provider: str, model: str):
+    def __init__(self, provider: str, model: str, budget: CallBudget,
+                 request_timeout_s: float = 30.0):
         self.provider = provider
         self.model = model
+        self.budget = budget
         self.history = [] 
 
         if provider == "openai":
@@ -39,7 +89,12 @@ class ChatModel:
             from google import genai  
             from google.genai import types
             
-            self._raw_client = genai.Client()
+            self._raw_client = genai.Client(
+                http_options=types.HttpOptions(
+                    timeout=int(request_timeout_s * 1000),
+                    retry_options=types.HttpRetryOptions(attempts=1),
+                )
+            )
             
             gen_config = types.GenerateContentConfig(
                 thinking_config=types.ThinkingConfig(thinking_level="low"),
@@ -81,6 +136,7 @@ class ChatModel:
         last_err = None
         for attempt in range(max_retries):
             try:
+                self.budget.consume()
                 reply = self._call_once(user_text)
                 break
             except Exception as e:
@@ -89,7 +145,9 @@ class ChatModel:
                 is_rate_limit = any(code in msg for code in
                                      ["429", "RESOURCE_EXHAUSTED", "rate_limit"])
                 is_overloaded = any(code in msg for code in
-                                     ["503", "UNAVAILABLE", "overloaded", "Timeout"])
+                                     ["503", "UNAVAILABLE", "overloaded", "Timeout",
+                                      "ReadTimeout", "timed out", "504",
+                                      "DEADLINE_EXCEEDED"])
                 if not (is_rate_limit or is_overloaded) or attempt == max_retries - 1:
                     raise
                 if is_rate_limit:
@@ -167,10 +225,41 @@ def build_question_prompt(item: dict) -> str:
         f"Answer with exactly one letter: A, B, C, or D. Do not include any other text."
     )
 
+
+def select_smoke_items(items: list[dict], count: int) -> list[dict]:
+    """Choose a deterministic small sample with broad source/domain/gold coverage."""
+    if count < 1:
+        raise ValueError("--smoke-test must be at least 1")
+    if count >= len(items):
+        return list(items)
+    selected = []
+    remaining = list(items)
+    seen_domains = Counter()
+    seen_golds = Counter()
+    seen_sources = Counter()
+    while len(selected) < count:
+        def score(item: dict) -> tuple:
+            source = item.get("provenance", {}).get("source", "original_pilot")
+            return (
+                seen_sources[source],
+                seen_golds[item["gold"]],
+                seen_domains[item["domain"]],
+                item["id"],
+            )
+        chosen = min(remaining, key=score)
+        remaining.remove(chosen)
+        selected.append(chosen)
+        seen_domains[chosen["domain"]] += 1
+        seen_golds[chosen["gold"]] += 1
+        seen_sources[chosen.get("provenance", {}).get("source", "original_pilot")] += 1
+    return selected
+
 # Main experiment loop
 
 def run_one_question(item: dict, ladder: list[dict], phrase_list: list[str],
-                      provider: str, model: str, sleep_s: float = 0.0) -> dict:
+                      provider: str, model: str, budget: CallBudget,
+                      sleep_s: float = 0.0,
+                      request_timeout_s: float = 30.0) -> dict:
     record = {
         "id": item["id"],
         "domain": item["domain"],
@@ -186,7 +275,7 @@ def run_one_question(item: dict, ladder: list[dict], phrase_list: list[str],
         "consistency_check": None,  # filled in only if a flip happened
     }
 
-    chat = ChatModel(provider, model)
+    chat = ChatModel(provider, model, budget, request_timeout_s)
     q_prompt = build_question_prompt(item)
     baseline_reply = chat.say(q_prompt)
     record["transcript"].append({"speaker": "user", "text": q_prompt})
@@ -224,7 +313,7 @@ def run_one_question(item: dict, ladder: list[dict], phrase_list: list[str],
 
     # Consistency check: fresh conversation, same question, no pushback.
     if record["flip_level"] is not None:
-        fresh_chat = ChatModel(provider, model)
+        fresh_chat = ChatModel(provider, model, budget, request_timeout_s)
         fresh_reply = fresh_chat.say(q_prompt)
         fresh_letter = parse_letter(fresh_reply)
         if fresh_letter == item["gold"]:
@@ -243,24 +332,64 @@ def run_one_question(item: dict, ladder: list[dict], phrase_list: list[str],
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--provider", required=True, choices=["openai", "anthropic", "gemini"])
-    ap.add_argument("--model", required=True, help="e.g. gpt-4o-mini, claude-3-5-haiku-latest, or gemini-2.5-flash")
+    ap.add_argument("--provider", choices=["openai", "anthropic", "gemini"])
+    ap.add_argument("--model", help="e.g. gpt-4o-mini, claude-3-5-haiku-latest, or gemini-2.5-flash")
     ap.add_argument("--data", default="../data/pilot_questions.json")
     ap.add_argument("--ladder", default="../data/pushback_ladder.json")
-    ap.add_argument("--out", required=True, help="output .jsonl path")
-    ap.add_argument("--limit", type=int, default=None, help="only run first N questions (useful for a quick smoke test)")
+    ap.add_argument("--out", help="output .jsonl path; required for a live run")
+    ap.add_argument("--limit", type=int, default=None, help="run only the first N questions (legacy deterministic subset)")
+    ap.add_argument("--smoke-test", type=int, metavar="N",
+                    help="select N questions for broad source/domain/gold coverage")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="show the selected questions and call ceiling without contacting a provider")
+    ap.add_argument("--max-api-calls", type=int,
+                    help="hard provider-call budget, including retries; defaults to 6 per selected question")
+    ap.add_argument("--confirm-full-run", action="store_true",
+                    help="required to run an entire dataset without --limit or --smoke-test")
     ap.add_argument("--sleep", type=float, default=0.0, help="seconds to sleep between turns (rate limiting)")
+    ap.add_argument("--request-timeout", type=float, default=30.0,
+                    help="per-request timeout in seconds (default: 30)")
     ap.add_argument("--resume", action="store_true",
                      help="skip questions whose id is already present in --out, and append "
                           "rather than overwrite. Use this after any crash / rate-limit / "
                           "Ctrl+C so you never lose completed questions or re-burn quota on them.")
     args = ap.parse_args()
 
+    if args.limit is not None and args.smoke_test is not None:
+        ap.error("use either --limit or --smoke-test, not both")
+    if not args.dry_run and (not args.provider or not args.model or not args.out):
+        ap.error("live runs require --provider, --model, and --out")
+    if not args.dry_run and args.limit is None and args.smoke_test is None and not args.confirm_full_run:
+        ap.error("refusing an accidental full run; use --smoke-test N, --limit N, or --confirm-full-run")
+
     data = json.loads(Path(args.data).read_text())
     ladder_data = json.loads(Path(args.ladder).read_text())
-    items = data["items"][: args.limit] if args.limit else data["items"]
+    items = data["items"]
+    if args.smoke_test is not None:
+        items = select_smoke_items(items, args.smoke_test)
+    elif args.limit is not None:
+        items = items[:args.limit]
     ladder = ladder_data["steps"]
     phrase_list = ladder_data["sycophancy_phrases"]
+
+    maximum_possible_calls = len(items) * (len(ladder) + 2)
+    call_limit = args.max_api_calls if args.max_api_calls is not None else maximum_possible_calls
+    if call_limit < len(items):
+        ap.error(f"--max-api-calls must be at least {len(items)} for {len(items)} baseline calls")
+    print(f"Selected {len(items)} question(s): {', '.join(x['id'] for x in items)}", file=sys.stderr)
+    print(
+        f"Call ceiling: {maximum_possible_calls} ({len(ladder) + 2} per question worst case); "
+        f"hard budget: {call_limit}", file=sys.stderr
+    )
+    if args.dry_run:
+        print("DRY RUN: no provider client was created and no API calls were made.", file=sys.stderr)
+        for item in items:
+            print(f"\n--- {item['id']} | gold={item['gold']} | domain={item['domain']} ---")
+            print(build_question_prompt(item))
+        return
+
+    budget = CallBudget(call_limit)
+    graceful_stop = GracefulStop()
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -277,17 +406,34 @@ def main():
     items = [it for it in items if it["id"] not in done_ids]
     file_mode = "a" if (args.resume and out_path.exists()) else "w"
 
-    with out_path.open(file_mode) as f:
-        for i, item in enumerate(items, 1):
-            print(f"[{i}/{len(items)}] {item['id']}...", file=sys.stderr)
-            record = run_one_question(item, ladder, phrase_list,
-                                       args.provider, args.model, args.sleep)
-            record["provider"] = args.provider
-            record["model"] = args.model
-            f.write(json.dumps(record) + "\n")
-            f.flush() 
+    written = 0
+    graceful_stop.install()
+    try:
+        with out_path.open(file_mode) as f:
+            for i, item in enumerate(items, 1):
+                print(f"[{i}/{len(items)}] {item['id']}...", file=sys.stderr)
+                record = run_one_question(item, ladder, phrase_list,
+                                           args.provider, args.model, budget, args.sleep,
+                                           args.request_timeout)
+                record["provider"] = args.provider
+                record["model"] = args.model
+                f.write(json.dumps(record) + "\n")
+                f.flush()
+                written += 1
+                if graceful_stop.requested:
+                    print(
+                        f"Stopped safely after saving {item['id']}. "
+                        "Use the same command with --resume to continue.",
+                        file=sys.stderr,
+                    )
+                    break
+    finally:
+        graceful_stop.restore()
 
-    print(f"Done. Wrote {len(items)} records to {out_path}", file=sys.stderr)
+    print(
+        f"Done. Wrote {written} record(s) this run to {out_path}. "
+        f"Provider calls used: {budget.used}/{budget.maximum}", file=sys.stderr
+    )
 
 
 if __name__ == "__main__":
