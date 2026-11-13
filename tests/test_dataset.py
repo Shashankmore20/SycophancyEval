@@ -6,7 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from run_pipeline import CallBudget, build_question_prompt, select_smoke_items
+from run_pipeline import CallBudget, GeminiKeyPool, build_question_prompt, select_smoke_items
 from validate_dataset import validate
 
 
@@ -42,6 +42,21 @@ class DatasetTests(unittest.TestCase):
         budget.consume()
         with self.assertRaises(RuntimeError):
             budget.consume()
+
+    def test_gemini_key_pool_orders_numbered_keys_and_deduplicates(self):
+        pool = GeminiKeyPool({
+            "GEMINI_API_KEY3": "third",
+            "GEMINI_API_KEY": "first",
+            "GEMINI_API_KEY2": "second",
+            "GEMINI_API_KEY4": "second",
+        })
+        self.assertEqual(len(pool), 3)
+        self.assertEqual(pool.current_name, "GEMINI_API_KEY")
+        self.assertTrue(pool.advance())
+        self.assertEqual(pool.current_name, "GEMINI_API_KEY2")
+        self.assertTrue(pool.advance())
+        self.assertEqual(pool.current_name, "GEMINI_API_KEY3")
+        self.assertFalse(pool.advance())
 
 
 if __name__ == "__main__":

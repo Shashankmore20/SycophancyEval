@@ -13,6 +13,7 @@ Runs each MCQ question through:
 """
 import argparse
 import json
+import os
 import re
 import signal
 import sys
@@ -39,6 +40,49 @@ class CallBudget:
                 "Re-run with --resume and a larger --max-api-calls only if intended."
             )
         self.used += 1
+
+
+class GeminiKeyPool:
+    """Ordered Gemini API keys loaded from GEMINI_API_KEY, GEMINI_API_KEY2, ..."""
+
+    def __init__(self, environ=None):
+        environ = os.environ if environ is None else environ
+        candidates = []
+        if environ.get("GEMINI_API_KEY"):
+            candidates.append((0, "GEMINI_API_KEY", environ["GEMINI_API_KEY"]))
+        for name, value in environ.items():
+            match = re.fullmatch(r"GEMINI_API_KEY(\d+)", name)
+            if match and value:
+                candidates.append((int(match.group(1)), name, value))
+        candidates.sort(key=lambda row: (row[0], row[1]))
+        self._keys = []
+        seen_values = set()
+        for _, name, value in candidates:
+            if value not in seen_values:
+                self._keys.append((name, value))
+                seen_values.add(value)
+        self.index = 0
+
+    def __len__(self):
+        return len(self._keys)
+
+    @property
+    def current_name(self) -> str:
+        return self._keys[self.index][0]
+
+    @property
+    def current_key(self) -> str:
+        return self._keys[self.index][1]
+
+    def advance(self) -> bool:
+        if self.index + 1 >= len(self._keys):
+            return False
+        self.index += 1
+        return True
+
+
+class GeminiKeysExhausted(RuntimeError):
+    """All configured Gemini keys returned quota or rate-limit errors."""
 
 
 class GracefulStop:
@@ -73,11 +117,14 @@ class ChatModel:
 
 
     def __init__(self, provider: str, model: str, budget: CallBudget,
-                 request_timeout_s: float = 30.0):
+                 request_timeout_s: float = 30.0,
+                 gemini_key_pool: Optional[GeminiKeyPool] = None):
         self.provider = provider
         self.model = model
         self.budget = budget
         self.history = [] 
+        self.request_timeout_s = request_timeout_s
+        self.gemini_key_pool = gemini_key_pool
 
         if provider == "openai":
             from openai import OpenAI 
@@ -88,21 +135,41 @@ class ChatModel:
         elif provider == "gemini":
             from google import genai  
             from google.genai import types
-            
-            self._raw_client = genai.Client(
+
+            if not gemini_key_pool or not len(gemini_key_pool):
+                raise ValueError(
+                    "No Gemini key found. Set GEMINI_API_KEY and optionally "
+                    "GEMINI_API_KEY2, GEMINI_API_KEY3, ..."
+                )
+            self._genai = genai
+            self._genai_types = types
+            self._gen_config = types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(thinking_level="low"),
+            )
+            self._create_gemini_chat()
+        else:
+            raise ValueError(f"Unknown provider: {provider}")
+
+    def _create_gemini_chat(self, prior_history=None) -> None:
+        types = self._genai_types
+        self._raw_client = self._genai.Client(
+                api_key=self.gemini_key_pool.current_key,
                 http_options=types.HttpOptions(
-                    timeout=int(request_timeout_s * 1000),
+                    timeout=int(self.request_timeout_s * 1000),
                     retry_options=types.HttpRetryOptions(attempts=1),
                 )
             )
-            
-            gen_config = types.GenerateContentConfig(
-                thinking_config=types.ThinkingConfig(thinking_level="low"),
+        gemini_history = []
+        for turn in prior_history or []:
+            role = "model" if turn["role"] == "assistant" else "user"
+            gemini_history.append(
+                types.Content(role=role, parts=[types.Part(text=turn["content"])])
             )
-            
-            self._client = self._raw_client.chats.create(model=model, config=gen_config)
-        else:
-            raise ValueError(f"Unknown provider: {provider}")
+        self._client = self._raw_client.chats.create(
+            model=self.model,
+            config=self._gen_config,
+            history=gemini_history,
+        )
 
     def _call_once(self, user_text: str) -> str:
         if self.provider == "openai":
@@ -148,6 +215,20 @@ class ChatModel:
                                      ["503", "UNAVAILABLE", "overloaded", "Timeout",
                                       "ReadTimeout", "timed out", "504",
                                       "DEADLINE_EXCEEDED"])
+                if is_rate_limit and self.provider == "gemini":
+                    if self.gemini_key_pool.advance():
+                        previous_turns = self.history[:-1]
+                        print(
+                            f"  [Gemini quota/rate limit; switching to "
+                            f"{self.gemini_key_pool.current_name}]",
+                            file=sys.stderr,
+                        )
+                        self._create_gemini_chat(previous_turns)
+                        continue
+                    raise GeminiKeysExhausted(
+                        "all configured Gemini API keys are quota/rate limited; "
+                        "completed questions are saved, so retry later with --resume"
+                    ) from e
                 if not (is_rate_limit or is_overloaded) or attempt == max_retries - 1:
                     raise
                 if is_rate_limit:
@@ -259,7 +340,8 @@ def select_smoke_items(items: list[dict], count: int) -> list[dict]:
 def run_one_question(item: dict, ladder: list[dict], phrase_list: list[str],
                       provider: str, model: str, budget: CallBudget,
                       sleep_s: float = 0.0,
-                      request_timeout_s: float = 30.0) -> dict:
+                      request_timeout_s: float = 30.0,
+                      gemini_key_pool: Optional[GeminiKeyPool] = None) -> dict:
     record = {
         "id": item["id"],
         "domain": item["domain"],
@@ -275,7 +357,7 @@ def run_one_question(item: dict, ladder: list[dict], phrase_list: list[str],
         "consistency_check": None,  # filled in only if a flip happened
     }
 
-    chat = ChatModel(provider, model, budget, request_timeout_s)
+    chat = ChatModel(provider, model, budget, request_timeout_s, gemini_key_pool)
     q_prompt = build_question_prompt(item)
     baseline_reply = chat.say(q_prompt)
     record["transcript"].append({"speaker": "user", "text": q_prompt})
@@ -313,7 +395,7 @@ def run_one_question(item: dict, ladder: list[dict], phrase_list: list[str],
 
     # Consistency check: fresh conversation, same question, no pushback.
     if record["flip_level"] is not None:
-        fresh_chat = ChatModel(provider, model, budget, request_timeout_s)
+        fresh_chat = ChatModel(provider, model, budget, request_timeout_s, gemini_key_pool)
         fresh_reply = fresh_chat.say(q_prompt)
         fresh_letter = parse_letter(fresh_reply)
         if fresh_letter == item["gold"]:
@@ -390,6 +472,19 @@ def main():
 
     budget = CallBudget(call_limit)
     graceful_stop = GracefulStop()
+    gemini_key_pool = None
+    if args.provider == "gemini":
+        gemini_key_pool = GeminiKeyPool()
+        if not len(gemini_key_pool):
+            ap.error(
+                "no Gemini API key found; set GEMINI_API_KEY and optionally "
+                "GEMINI_API_KEY2, GEMINI_API_KEY3, ..."
+            )
+        print(
+            f"Gemini key pool: {len(gemini_key_pool)} key(s); "
+            f"starting with {gemini_key_pool.current_name}",
+            file=sys.stderr,
+        )
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -412,9 +507,13 @@ def main():
         with out_path.open(file_mode) as f:
             for i, item in enumerate(items, 1):
                 print(f"[{i}/{len(items)}] {item['id']}...", file=sys.stderr)
-                record = run_one_question(item, ladder, phrase_list,
-                                           args.provider, args.model, budget, args.sleep,
-                                           args.request_timeout)
+                try:
+                    record = run_one_question(item, ladder, phrase_list,
+                                               args.provider, args.model, budget, args.sleep,
+                                               args.request_timeout, gemini_key_pool)
+                except GeminiKeysExhausted as exc:
+                    print(f"Stopped: {exc}", file=sys.stderr)
+                    break
                 record["provider"] = args.provider
                 record["model"] = args.model
                 f.write(json.dumps(record) + "\n")

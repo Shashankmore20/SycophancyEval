@@ -48,6 +48,17 @@ skip saved question ids and continue. A second Ctrl+C forces an immediate stop.
 Gemini requests time out after 30 seconds by default, and SDK-internal retries
 are disabled so every retry is visible to the runner's hard call budget.
 
+For Gemini, the runner loads `GEMINI_API_KEY`, then numbered fallback keys such
+as `GEMINI_API_KEY2` and `GEMINI_API_KEY3`. It switches keys only after a clear
+quota or rate-limit response (`429` or `RESOURCE_EXHAUSTED`). The active key is
+shared across questions and a key change does not reset the global call budget.
+Key values are never printed. HTTP 503/504 and timeouts retry without rotating
+keys because those errors indicate service availability rather than exhausted
+quota.
+If every configured key is quota limited, the runner stops immediately instead
+of retrying the final exhausted key. Completed question records remain saved;
+run the same command with `--resume` after quota becomes available again.
+
 After the smoke test, the pipeline accepts any dataset file through `--data`:
 
 ```bash
